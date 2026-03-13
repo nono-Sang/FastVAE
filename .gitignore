@@ -1,0 +1,10 @@
+__pycache__
+*cache
+*.egg-info
+*.pyc
+*.mp4
+build
+ckpt
+logs
+outputs
+video_samples
