@@ -1,9 +1,11 @@
+import os
+
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from fastvae.dist.comm_ops import gather_tensor, split_tensor
 from fastvae.dist.env import DistributedEnv as dist_env
 from fastvae.models.para_utils import DistCausalConv3d, DistConv2d, DistZeroPad2d
 from fastvae.models.wan.vae2_1 import RMS_norm, Upsample
@@ -181,54 +183,45 @@ class DistAttentionBlock(nn.Module):
 
         nn.init.zeros_(self.proj.weight)
 
-    def _gather_full_height(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, list[int] | None]:
         world_size = dist_env.get_vae_group_size()
-        if world_size <= 1:
-            return x, None
-
-        group = dist_env.get_vae_group()
-        height = torch.tensor([x.shape[-2]], device=x.device, dtype=torch.int64)
-        size_list = [torch.zeros_like(height) for _ in range(world_size)]
-        dist.all_gather(size_list, height, group=group)
-        sizes = [int(s.item()) for s in size_list]
-
-        max_h = max(sizes)
-        if x.shape[-2] < max_h:
-            x = F.pad(x, (0, 0, 0, max_h - x.shape[-2], 0, 0))
-
-        patch_list = [torch.empty_like(x) for _ in range(world_size)]
-        dist.all_gather(patch_list, x, group=group)
-        patch_list = [
-            t[..., : sizes[i], :].contiguous() for i, t in enumerate(patch_list)
-        ]
-        return torch.cat(patch_list, dim=-2), sizes
-
-    def _split_height(self, x: torch.Tensor, sizes: list[int] | None) -> torch.Tensor:
-        if sizes is None:
-            return x
-        rank = dist_env.get_vae_rank()
-        start = sum(sizes[:rank])
-        end = start + sizes[rank]
-        return x[..., start:end, :].contiguous()
+        env_flag = os.getenv("FASTVAE_SDPA_PARALLEL", "0").strip().lower()
+        self.sdpa_parallel = env_flag in ("1", "true", "on", "yes") and world_size > 1
 
     def forward(self, x):
-        x_full, sizes = self._gather_full_height(x)
+        x_full, sizes = gather_tensor(x, dim=-2, return_sizes=True)
         identity = x_full
         b, c, t, h, w = x_full.size()
         x_full = rearrange(x_full, "b c t h w -> (b t) c h w")
-        x_full = self.norm(x_full)
-        q, k, v = (
-            self.to_qkv(x_full)
-            .reshape(b * t, 1, c * 3, -1)
-            .permute(0, 1, 3, 2)
-            .contiguous()
-            .chunk(3, dim=-1)
-        )
-        x_full = F.scaled_dot_product_attention(q, k, v)
-        x_full = x_full.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
-        x_full = self.proj(x_full)
+        if self.sdpa_parallel:
+            x_local, bt_sizes = split_tensor(x_full, dim=0, return_sizes=True)
+            x_local = self.norm(x_local)
+            if x_local.shape[0] == 0:
+                x_local = x_local.new_empty((0, c, h, w))
+            else:
+                q, k, v = (
+                    self.to_qkv(x_local)
+                    .reshape(x_local.shape[0], 1, c * 3, -1)
+                    .permute(0, 1, 3, 2)
+                    .contiguous()
+                    .chunk(3, dim=-1)
+                )
+                x_local = F.scaled_dot_product_attention(q, k, v)
+                x_local = x_local.squeeze(1).permute(0, 2, 1).reshape(-1, c, h, w)
+            x_local = self.proj(x_local)
+            x_full = gather_tensor(x_local, dim=0, sizes=bt_sizes)
+        else:
+            x_full = self.norm(x_full)
+            q, k, v = (
+                self.to_qkv(x_full)
+                .reshape(b * t, 1, c * 3, -1)
+                .permute(0, 1, 3, 2)
+                .contiguous()
+                .chunk(3, dim=-1)
+            )
+            x_full = F.scaled_dot_product_attention(q, k, v)
+            x_full = x_full.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
+            x_full = self.proj(x_full)
         x_full = rearrange(x_full, "(b t) c h w-> b c t h w", t=t)
         x_full = x_full + identity
-        return self._split_height(x_full, sizes)
+        x_out = split_tensor(x_full, dim=-2, sizes=sizes)
+        return x_out
