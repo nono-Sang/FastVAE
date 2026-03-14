@@ -4,6 +4,7 @@ import time
 
 import torch
 import torch.distributed as dist
+import torch.profiler
 from diffusers.utils import export_to_video, load_video
 from diffusers.video_processor import VideoProcessor
 
@@ -83,21 +84,53 @@ def main(args: argparse.Namespace) -> None:
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    start_time = time.perf_counter()
-    encoded = model.encode(videos)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    encode_time = time.perf_counter() - start_time
+    enable_profile = args.profile and (args.profile_all_ranks or rank == 0)
+    if enable_profile:
+        os.makedirs(args.profile_dir, exist_ok=True)
+        trace_path = os.path.join(args.profile_dir, f"trace_rank{rank}.json")
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=args.profile_with_stack,
+        ) as prof:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            with torch.profiler.record_function("encode"):
+                encoded = model.encode(videos)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            encode_time = time.perf_counter() - start_time
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    start_time = time.perf_counter()
-    decoded = model.decode(encoded)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    decode_time = time.perf_counter() - start_time
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            with torch.profiler.record_function("decode"):
+                decoded = model.decode(encoded)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            decode_time = time.perf_counter() - start_time
+        prof.export_chrome_trace(trace_path)
+    else:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        encoded = model.encode(videos)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        encode_time = time.perf_counter() - start_time
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        decoded = model.decode(encoded)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        decode_time = time.perf_counter() - start_time
 
     total_time = encode_time + decode_time
     decoded_tensor = torch.stack(decoded, dim=0)
@@ -139,6 +172,10 @@ def get_args():
         "--model", choices=sorted(MODEL_REGISTRY.keys()), default="DistWan2_2_VAE"
     )
     parser.add_argument("--dtype", default="bf16")
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-dir", default="profiles")
+    parser.add_argument("--profile-with-stack", action="store_true")
+    parser.add_argument("--profile-all-ranks", action="store_true")
     return parser.parse_args()
 
 
