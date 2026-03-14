@@ -4,7 +4,7 @@ FastVAE is a high-performance framework that accelerates VAE encoding and decodi
 
 ## Performance
 
-720p video, A800 GPU, bf16. Results are measured after one warmup pass, and peak memory is `torch.cuda.max_memory_allocated()` on rank0.
+5s 720p video, A800 GPU, bf16. Results are measured after one warmup pass, and peak memory is `torch.cuda.max_memory_allocated()` on rank0.
 
 ### Wan2_2
 
