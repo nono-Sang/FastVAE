@@ -164,29 +164,26 @@ class DistConv2d(nn.Conv2d):
         self.world_size = dist_env.get_vae_group_size()
         self.group = dist_env.get_vae_group()
 
-    def forward(self, x, patch_height_index=None):
+    def forward(self, x):
         padding = list(self._padding)
 
         if self.world_size == 1:
             x = F.pad(x, padding)
             return super().forward(x)
 
-        if patch_height_index is None:
-            height = x.shape[-2]
-            device = x.device
-            patch_height_list = [
-                torch.zeros(1, dtype=torch.int64, device=device)
-                for _ in range(self.world_size)
-            ]
-            dist.all_gather(
-                patch_height_list,
-                torch.tensor([height], dtype=torch.int64, device=device),
-                group=self.group,
-            )
-            patch_height_index = _calc_patch_height_index(patch_height_list)
-            patch_height_index = patch_height_index.cpu().tolist()
-
-        self.patch_height_index = patch_height_index
+        height = x.shape[-2]
+        device = x.device
+        patch_height_list = [
+            torch.zeros(1, dtype=torch.int64, device=device)
+            for _ in range(self.world_size)
+        ]
+        dist.all_gather(
+            patch_height_list,
+            torch.tensor([height], dtype=torch.int64, device=device),
+            group=self.group,
+        )
+        patch_height_index = _calc_patch_height_index(patch_height_list)
+        self.patch_height_index = patch_height_index.cpu().tolist()
 
         self.curr_top_halo_size = _calc_top_halo_size(
             self.rank,
@@ -286,7 +283,7 @@ class DistCausalConv3d(nn.Conv3d):
         self.world_size = dist_env.get_vae_group_size()
         self.group = dist_env.get_vae_group()
 
-    def forward(self, x, cache_x=None, patch_height_index=None):
+    def forward(self, x, cache_x=None):
         padding = list(self.causal_padding)
         if cache_x is not None and self.causal_padding[4] > 0:
             cache_x = cache_x.to(x.device)
@@ -297,22 +294,19 @@ class DistCausalConv3d(nn.Conv3d):
             x = F.pad(x, padding)
             return super().forward(x)
 
-        if patch_height_index is None:
-            height = x.shape[-2]
-            device = x.device
-            patch_height_list = [
-                torch.zeros(1, dtype=torch.int64, device=device)
-                for _ in range(self.world_size)
-            ]
-            dist.all_gather(
-                patch_height_list,
-                torch.tensor([height], dtype=torch.int64, device=device),
-                group=self.group,
-            )
-            patch_height_index = _calc_patch_height_index(patch_height_list)
-            patch_height_index = patch_height_index.cpu().tolist()
-
-        self.patch_height_index = patch_height_index
+        height = x.shape[-2]
+        device = x.device
+        patch_height_list = [
+            torch.zeros(1, dtype=torch.int64, device=device)
+            for _ in range(self.world_size)
+        ]
+        dist.all_gather(
+            patch_height_list,
+            torch.tensor([height], dtype=torch.int64, device=device),
+            group=self.group,
+        )
+        patch_height_index = _calc_patch_height_index(patch_height_list)
+        self.patch_height_index = patch_height_index.cpu().tolist()
 
         self.curr_top_halo_size = _calc_top_halo_size(
             self.rank,

@@ -7,10 +7,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 from torch.testing import assert_close
 
 from fastvae.models.para_utils import DistCausalConv3d, DistConv2d, DistZeroPad2d
-from fastvae.models.wan.vae2_2 import CausalConv3d
 
 from .utils import (
     destroy_dist,
@@ -50,7 +50,7 @@ def _reference_causal_conv3d(
     stride: int,
     padding: int,
 ) -> torch.Tensor:
-    layer = CausalConv3d(in_ch, out_ch, kernel, stride=stride, padding=padding)
+    layer = WanCausalConv3d(in_ch, out_ch, kernel, stride=stride, padding=padding)
     layer.load_state_dict(state_dict)
     return layer.to(x.device)(x)
 
@@ -217,7 +217,7 @@ def test_dist_causal_conv3d(case, world_size):
 
     batch, in_ch, frames, height, width = case["shape"]
     out_ch = in_ch * 3
-    conv = CausalConv3d(
+    conv = WanCausalConv3d(
         in_ch, out_ch, case["kernel"], stride=case["stride"], padding=case["padding"]
     )
     state_dict = conv.state_dict()
