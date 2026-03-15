@@ -1,6 +1,6 @@
 ## About
 
-FastVAE is a high-performance framework that accelerates VAE encoding and decoding through parallel implementation while significantly reducing GPU memory footprint.
+FastVAE is a lightweight plugin that accelerates diffusers VAE encoding and decoding through parallel implementation while reducing GPU memory footprint.
 
 ## Usage
 ```python
