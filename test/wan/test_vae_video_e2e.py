@@ -5,20 +5,30 @@ import time
 import torch
 import torch.distributed as dist
 import torch.profiler
+from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 from diffusers.utils import export_to_video, load_video
 from diffusers.video_processor import VideoProcessor
 
-from fastvae.dist.env import DistributedEnv
-from fastvae.models.wan.para_vae2_1 import DistWan2_1_VAE
-from fastvae.models.wan.para_vae2_2 import DistWan2_2_VAE
-from fastvae.models.wan.vae2_1 import Wan2_1_VAE
-from fastvae.models.wan.vae2_2 import Wan2_2_VAE
+from fastvae.models.wan.para_wan_vae import apply_wan_dist_patch
+
+try:
+    from ..utils import init_dist
+except ImportError:  # allow running as a script
+    import os
+    import sys
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from test.utils import init_dist
 
 MODEL_REGISTRY = {
-    "DistWan2_1_VAE": DistWan2_1_VAE,
-    "DistWan2_2_VAE": DistWan2_2_VAE,
-    "Wan2_1_VAE": Wan2_1_VAE,
-    "Wan2_2_VAE": Wan2_2_VAE,
+    "Wan21": {
+        "latent_channels": 16,
+    },
+    "Wan22": {
+        "latent_channels": 48,
+    },
 }
 
 
@@ -31,27 +41,11 @@ def _parse_dtype(dtype: str) -> torch.dtype:
     return torch.float32
 
 
-def _init_distributed() -> tuple[int, int, int]:
-    if not dist.is_available():
-        return 0, 0, 1
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if world_size <= 1:
-        return rank, local_rank, world_size
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    if not dist.is_initialized():
-        dist.init_process_group(backend=backend, init_method="env://")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-    DistributedEnv.initialize(dist.group.WORLD)
-    return rank, local_rank, world_size
-
-
 @torch.no_grad()
 def main(args: argparse.Namespace) -> None:
-    model_cls = MODEL_REGISTRY[args.model]
-    rank, local_rank, world_size = _init_distributed()
+    model_spec = MODEL_REGISTRY[args.model]
+    rank, local_rank, world_size = init_dist()
+    apply_wan_dist_patch()
 
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else "cpu"
     dtype = _parse_dtype(args.dtype)
@@ -61,25 +55,21 @@ def main(args: argparse.Namespace) -> None:
 
     ckpt_path = args.ckpt
     video_path = args.input_video
-
-    latent_channels = 48 if "2_2" in args.model else 16
-    video_processor = VideoProcessor(vae_latent_channels=latent_channels)
+    video_processor = VideoProcessor(vae_latent_channels=model_spec["latent_channels"])
 
     video = load_video(video_path)
     video = video_processor.preprocess_video(video, args.height, args.width)
     video = video.to(device=device, dtype=dtype)
 
-    model = model_cls(
-        vae_pth=ckpt_path,
-        dtype=dtype,
-        device=device,
+    model = AutoencoderKLWan.from_pretrained(
+        ckpt_path, subfolder="vae", torch_dtype=dtype
     )
-
-    videos = [video[i] for i in range(video.shape[0])]
+    model.to(device).eval()
 
     # warmup
-    warmup_encoded = model.encode(videos)
-    _ = model.decode(warmup_encoded)
+    warmup_dist = model.encode(video).latent_dist
+    warmup_latents = warmup_dist.sample()
+    _ = model.decode(warmup_latents).sample
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
@@ -101,7 +91,7 @@ def main(args: argparse.Namespace) -> None:
                 torch.cuda.synchronize()
             start_time = time.perf_counter()
             with torch.profiler.record_function("encode"):
-                encoded = model.encode(videos)
+                encoded = model.encode(video).latent_dist.sample()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             encode_time = time.perf_counter() - start_time
@@ -110,7 +100,7 @@ def main(args: argparse.Namespace) -> None:
                 torch.cuda.synchronize()
             start_time = time.perf_counter()
             with torch.profiler.record_function("decode"):
-                decoded = model.decode(encoded)
+                decoded = model.decode(encoded).sample
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             decode_time = time.perf_counter() - start_time
@@ -119,7 +109,7 @@ def main(args: argparse.Namespace) -> None:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         start_time = time.perf_counter()
-        encoded = model.encode(videos)
+        encoded = model.encode(video).latent_dist.sample()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         encode_time = time.perf_counter() - start_time
@@ -127,19 +117,16 @@ def main(args: argparse.Namespace) -> None:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         start_time = time.perf_counter()
-        decoded = model.decode(encoded)
+        decoded = model.decode(encoded).sample
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         decode_time = time.perf_counter() - start_time
 
     total_time = encode_time + decode_time
-    decoded_tensor = torch.stack(decoded, dim=0)
 
-    if rank == 0:
+    if rank == 0 and decoded is not None:
         os.makedirs(args.output_dir, exist_ok=True)
-        output_videos = video_processor.postprocess_video(
-            decoded_tensor, output_type="pil"
-        )
+        output_videos = video_processor.postprocess_video(decoded, output_type="pil")
         for i, frames in enumerate(output_videos):
             output_path = os.path.join(args.output_dir, f"{args.model}_output_{i}.mp4")
             export_to_video(frames, output_path, fps=args.fps)
@@ -160,16 +147,16 @@ def main(args: argparse.Namespace) -> None:
 
 def get_args():
     parser = argparse.ArgumentParser()
-    # modelscope download --model Wan-AI/Wan2.1-T2V-14B Wan2.1_VAE.pth --local_dir ./ckpt/wan2_1/
-    # modelscope download --model Wan-AI/Wan2.2-TI2V-5B Wan2.2_VAE.pth --local_dir ./ckpt/wan2_2/
-    parser.add_argument("--ckpt", default="ckpt/wan2_2/Wan2.2_VAE.pth")
+    # modelscope download --model Wan-AI/Wan2.1-T2V-14B-Diffusers --include 'vae/*' --local_dir ./ckpt/wan2_1/
+    # modelscope download --model Wan-AI/Wan2.2-TI2V-5B-Diffusers --include 'vae/*' --local_dir ./ckpt/wan2_2/
+    parser.add_argument("--ckpt", default="ckpt/wan2_2/")
     parser.add_argument("--input-video", default="video_samples/input_video.mp4")
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--height", type=int, default=1280)
     parser.add_argument("--width", type=int, default=720)
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument(
-        "--model", choices=sorted(MODEL_REGISTRY.keys()), default="DistWan2_2_VAE"
+        "--model", choices=sorted(MODEL_REGISTRY.keys()), default="Wan22"
     )
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--profile", action="store_true")

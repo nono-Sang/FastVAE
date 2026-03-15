@@ -2,6 +2,25 @@
 
 FastVAE is a high-performance framework that accelerates VAE encoding and decoding through parallel implementation while significantly reducing GPU memory footprint.
 
+## Usage
+```python
+from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
+from fastvae.models.wan.para_wan_vae import apply_wan_dist_patch, remove_wan_dist_patch
+
+# Baseline
+vae = AutoencoderKLWan.from_pretrained(...)
+encoded = model.encode(video).latent_dist.sample()
+decoded = model.decode(encoded).sample
+
+# Parallel (monkey patch)
+apply_wan_dist_patch()
+vae = AutoencoderKLWan.from_pretrained(...)
+encoded = model.encode(video).latent_dist.sample()
+decoded = model.decode(encoded).sample
+remove_wan_dist_patch()
+
+```
+
 ## Performance
 
 5s 720p video, A800 GPU, bf16. Results are measured after one warmup pass, and peak memory is `torch.cuda.max_memory_allocated()` on rank0.
@@ -10,16 +29,16 @@ FastVAE is a high-performance framework that accelerates VAE encoding and decodi
 
 | Processes | Encode (s) | Decode (s) | Total (s) | Peak Mem |
 | --- | --- | --- | --- | --- |
-| 1 | 3.347 | 11.799 | 15.147 | 22.583 GB |
-| 2 | 2.209 | 7.073 | 9.282 | 13.609 GB |
-| 4 | 1.473 | 4.081 | 5.555 | 9.121 GB |
-| 8 | 1.115 | 2.517 | 3.632 | 7.930 GB |
+| 1 | 2.833 | 10.336 | 13.170 | 13.829 GB |
+| 2 | 1.957 | 6.164 | 8.121 | 8.336 GB |
+| 4 | 1.343 | 3.592 | 4.935 | 5.589 GB |
+| 8 | 1.044 | 2.245 | 3.289 | 4.218 GB |
 
 ### Wan2_1
 
 | Processes | Encode (s) | Decode (s) | Total (s) | Peak Mem |
 | --- | --- | --- | --- | --- |
-| 1 | 6.771 | 11.198 | 17.970 | 18.404 GB |
-| 2 | 4.024 | 6.552 | 10.576 | 10.437 GB |
-| 4 | 2.431 | 3.871 | 6.302 | 6.452 GB |
-| 8 | 1.618 | 2.424 | 4.041 | 5.783 GB |
+| 1 | 5.113 | 9.256 | 14.368 | 11.762 GB |
+| 2 | 3.387 | 5.452 | 8.839 | 6.761 GB |
+| 4 | 2.088 | 3.269 | 5.357 | 4.261 GB |
+| 8 | 1.465 | 2.156 | 3.621 | 3.017 GB |

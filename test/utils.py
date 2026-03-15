@@ -1,3 +1,4 @@
+import os
 import socket
 
 import torch
@@ -31,17 +32,36 @@ def find_free_port() -> int:
         return sock.getsockname()[1]
 
 
-def init_dist(rank: int, world_size: int, init_method: str) -> None:
+def init_dist(
+    rank: int | None = None,
+    world_size: int | None = None,
+    init_method: str | None = None,
+) -> tuple[int, int, int]:
+    if not dist.is_available():
+        return 0, 0, 1
+
+    if rank is None or world_size is None or init_method is None:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        rank = int(os.environ.get("RANK", "0"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        init_method = (
+            f"tcp://127.0.0.1:{find_free_port()}" if world_size <= 1 else "env://"
+        )
+    else:
+        local_rank = rank
+
     backend = "nccl" if USE_CUDA else "gloo"
-    if backend == "nccl":
-        torch.cuda.set_device(rank)
-    dist.init_process_group(
-        backend=backend,
-        init_method=init_method,
-        rank=rank,
-        world_size=world_size,
-    )
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend=backend,
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
+        )
+    if USE_CUDA:
+        torch.cuda.set_device(local_rank)
     dist_env.initialize(dist.group.WORLD)
+    return rank, local_rank, world_size
 
 
 def destroy_dist() -> None:
