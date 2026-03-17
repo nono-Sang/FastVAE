@@ -12,7 +12,7 @@ from diffusers.video_processor import VideoProcessor
 from fastvae.models.wan.para_wan_vae import apply_wan_dist_patch
 
 try:
-    from ..utils import init_dist
+    from ..utils import get_test_device, init_dist
 except ImportError:  # allow running as a script
     import os
     import sys
@@ -20,7 +20,7 @@ except ImportError:  # allow running as a script
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
-    from test.utils import init_dist
+    from test.utils import get_test_device, init_dist
 
 MODEL_REGISTRY = {
     "Wan21": {
@@ -44,10 +44,13 @@ def _parse_dtype(dtype: str) -> torch.dtype:
 @torch.no_grad()
 def main(args: argparse.Namespace) -> None:
     model_spec = MODEL_REGISTRY[args.model]
-    rank, local_rank, world_size = init_dist()
+    init_method = "env://"  # torchrun
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1:
+        init_dist(rank, world_size, init_method)
     apply_wan_dist_patch()
-
-    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else "cpu"
+    device = get_test_device(rank)
     dtype = _parse_dtype(args.dtype)
 
     if torch.cuda.is_available():
