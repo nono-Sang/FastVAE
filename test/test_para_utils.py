@@ -17,8 +17,15 @@ from .utils import (
     find_free_port,
     get_test_device,
     init_dist,
-    split_height,
 )
+
+
+def _split_height(total_height: int, world_size: int, rank: int) -> tuple[int, int]:
+    base = total_height // world_size
+    remainder = total_height % world_size
+    start = rank * base + min(rank, remainder)
+    end = start + base + (1 if rank < remainder else 0)
+    return start, end
 
 
 def _reference_zero_pad2d(
@@ -67,7 +74,7 @@ def _dist_worker(
     payload = torch.load(payload_file)
     device = get_test_device(rank)
     x = payload["x"].to(device)
-    start, end = split_height(x.shape[-2], world_size, rank)
+    start, end = _split_height(x.shape[-2], world_size, rank)
 
     if op == "zero_pad2d":
         layer = DistZeroPad2d(payload["padding"])
@@ -107,7 +114,7 @@ def _run_multi_rank(op: str, payload: dict, world_size: int) -> None:
     payload_file = tempfile.NamedTemporaryFile(delete=False)
     payload_file.close()
     torch.save(payload, payload_file.name)
-    init_method = f"tcp://127.0.0.1:{find_free_port()}"
+    init_method = f"tcp://127.0.0.1:{find_free_port()}"  # spawn
 
     try:
         mp.spawn(
