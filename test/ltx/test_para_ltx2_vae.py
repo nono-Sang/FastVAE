@@ -5,11 +5,13 @@ import tempfile
 import pytest
 import torch
 import torch.multiprocessing as mp
-from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
+from diffusers.models.autoencoders.autoencoder_kl_ltx2 import AutoencoderKLLTX2Video
 from torch.testing import assert_close
 
-from fastvae.models.wan.configs import WAN22_DIFFUSERS_CONFIG
-from fastvae.models.wan.para_wan_vae import apply_wan_dist_patch, remove_wan_dist_patch
+from fastvae.models.ltx.para_ltx2_vae import (
+    apply_ltx2_dist_patch,
+    remove_ltx2_dist_patch,
+)
 
 try:
     from ..utils import destroy_dist, find_free_port, get_test_device, init_dist
@@ -27,16 +29,15 @@ def _para_vae_func(
     rank: int, world_size: int, init_method: str, payload_file: str, output_dir: str
 ):
     init_dist(rank, world_size, init_method)
-    apply_wan_dist_patch()
+    apply_ltx2_dist_patch()
 
     payload = torch.load(payload_file)
     device = get_test_device(rank)
     x = payload["x"].to(device)
     z = payload["z"].to(device)
-    model_kwargs = payload["model_kwargs"]
     state_dict = payload["state_dict"]
 
-    model = AutoencoderKLWan(**model_kwargs)
+    model = AutoencoderKLLTX2Video()
     model.load_state_dict(state_dict)
     model.to(device).eval()
 
@@ -48,15 +49,14 @@ def _para_vae_func(
         torch.save(encoder_out, os.path.join(output_dir, "encoder_out.pt"))
         torch.save(decoder_out, os.path.join(output_dir, "decoder_out.pt"))
 
-    remove_wan_dist_patch()
+    remove_ltx2_dist_patch()
     destroy_dist()
 
 
-# scale_factor_temporal: 4, scale_factor_spatial: 8(wan2.1), 2x8(wan2.2, 2 is patchify)
-@pytest.mark.parametrize("model_kwargs", [{}, WAN22_DIFFUSERS_CONFIG])
-@pytest.mark.parametrize("x_shape", [(1, 3, 8, 128, 64), (1, 3, 4, 160, 160)])
+# scale_factor_temporal: 8, scale_factor_spatial: 4x8 (4 is patchify)
+@pytest.mark.parametrize("x_shape", [(1, 3, 9, 256, 64), (1, 3, 9, 288, 64)])
 @pytest.mark.parametrize("world_size", [1, 8])
-def test_para_wan_vae(x_shape, model_kwargs, world_size):
+def test_para_ltx2_vae(x_shape, world_size):
     torch.manual_seed(0)
 
     x = torch.randn(*x_shape)
@@ -64,7 +64,7 @@ def test_para_wan_vae(x_shape, model_kwargs, world_size):
     ## ref model
     device = get_test_device()
     x_ = x.to(device)
-    ref_model = AutoencoderKLWan(**model_kwargs)
+    ref_model = AutoencoderKLLTX2Video()
     ref_model.to(device).eval()
 
     with torch.no_grad():
@@ -73,11 +73,13 @@ def test_para_wan_vae(x_shape, model_kwargs, world_size):
         z_ = z.to(device)
         ref_decoder_out = ref_model.decode(z_).sample.cpu()
 
+    ref_model.cpu()
+    torch.cuda.empty_cache()
+
     ## para model
     payload = {
         "x": x,
         "z": z,
-        "model_kwargs": model_kwargs,
         "state_dict": ref_model.state_dict(),
     }
 

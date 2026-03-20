@@ -2,13 +2,13 @@ import logging
 
 from fastvae.dist.comm_ops import gather_tensor, split_tensor
 from fastvae.dist.env import DistributedEnv as dist_env
-from fastvae.models.para_utils import DistCausalConv3d, DistConv2d, DistZeroPad2d
+from fastvae.models.para_utils import DistConv2d, DistWanCausalConv3d, DistZeroPad2d
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def patch_attention_block_forward(forward_func):
+def _patch_attention_block_forward(forward_func):
     def dist_attention_block_forward(self, x):
         x, sizes = gather_tensor(x, dim=-2, return_sizes=True)
         x = forward_func(self, x)
@@ -30,7 +30,7 @@ def _downsampled_sizes(sizes: list[int], factor: int) -> list[int]:
     return out_sizes
 
 
-def patch_avgdown3d_forward(forward_func):
+def _patch_avgdown3d_forward(forward_func):
     def dist_avgdown3d_forward(self, x):
         x, sizes = gather_tensor(x, dim=3, return_sizes=True)
         x = forward_func(self, x)
@@ -41,7 +41,7 @@ def patch_avgdown3d_forward(forward_func):
     return dist_avgdown3d_forward
 
 
-def patch_encoder3d_forward(forward_func):
+def _patch_encoder3d_forward(forward_func):
     def dist_encoder3d_forward(self, x, feat_cache=None, feat_idx=[0]):
         x = split_tensor(x, dim=3)
         x = forward_func(self, x, feat_cache, feat_idx)
@@ -51,7 +51,7 @@ def patch_encoder3d_forward(forward_func):
     return dist_encoder3d_forward
 
 
-def patch_decoder3d_forward(forward_func):
+def _patch_decoder3d_forward(forward_func):
     def dist_decoder3d_forward(
         self, x, feat_cache=None, feat_idx=[0], first_chunk=False
     ):
@@ -87,18 +87,18 @@ def apply_wan_dist_patch():
 
     wan_vae.nn.Conv2d = DistConv2d
     wan_vae.nn.ZeroPad2d = DistZeroPad2d
-    wan_vae.WanCausalConv3d = DistCausalConv3d
+    wan_vae.WanCausalConv3d = DistWanCausalConv3d
 
-    wan_vae.AvgDown3D.forward = patch_avgdown3d_forward(
+    wan_vae.AvgDown3D.forward = _patch_avgdown3d_forward(
         wan_vae._FASTVAE_DIST_ORIGS["wan_avgdown3d_forward"]
     )
-    wan_vae.WanAttentionBlock.forward = patch_attention_block_forward(
+    wan_vae.WanAttentionBlock.forward = _patch_attention_block_forward(
         wan_vae._FASTVAE_DIST_ORIGS["wan_attention_forward"]
     )
-    wan_vae.WanEncoder3d.forward = patch_encoder3d_forward(
+    wan_vae.WanEncoder3d.forward = _patch_encoder3d_forward(
         wan_vae._FASTVAE_DIST_ORIGS["wan_encoder3d_forward"]
     )
-    wan_vae.WanDecoder3d.forward = patch_decoder3d_forward(
+    wan_vae.WanDecoder3d.forward = _patch_decoder3d_forward(
         wan_vae._FASTVAE_DIST_ORIGS["wan_decoder3d_forward"]
     )
 
