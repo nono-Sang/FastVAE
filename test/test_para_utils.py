@@ -7,10 +7,16 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+from diffusers.models.autoencoders.autoencoder_kl_ltx2 import LTX2VideoCausalConv3d
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 from torch.testing import assert_close
 
-from fastvae.models.para_utils import DistCausalConv3d, DistConv2d, DistZeroPad2d
+from fastvae.models.para_utils import (
+    DistConv2d,
+    DistLTX2VideoCausalConv3d,
+    DistWanCausalConv3d,
+    DistZeroPad2d,
+)
 
 from .utils import (
     destroy_dist,
@@ -48,7 +54,7 @@ def _reference_conv2d(
     return layer.to(x.device)(x)
 
 
-def _reference_causal_conv3d(
+def _reference_wan_causal_conv3d(
     x: torch.Tensor,
     state_dict: dict,
     in_ch: int,
@@ -60,6 +66,31 @@ def _reference_causal_conv3d(
     layer = WanCausalConv3d(in_ch, out_ch, kernel, stride=stride, padding=padding)
     layer.load_state_dict(state_dict)
     return layer.to(x.device)(x)
+
+
+def _reference_ltx2_causal_conv3d(
+    x: torch.Tensor,
+    state_dict: dict,
+    in_ch: int,
+    out_ch: int,
+    kernel: int,
+    stride: int,
+    dilation: int,
+    groups: int,
+    spatial_padding_mode: str,
+    causal: bool,
+) -> torch.Tensor:
+    layer = LTX2VideoCausalConv3d(
+        in_ch,
+        out_ch,
+        kernel_size=kernel,
+        stride=stride,
+        dilation=dilation,
+        groups=groups,
+        spatial_padding_mode=spatial_padding_mode,
+    )
+    layer.load_state_dict(state_dict)
+    return layer.to(x.device)(x, causal=causal)
 
 
 def _dist_worker(
@@ -90,8 +121,8 @@ def _dist_worker(
         layer.load_state_dict(payload["state_dict"])
         layer.to(device)
         out = layer(x[..., start:end, :])
-    elif op == "causal_conv3d":
-        layer = DistCausalConv3d(
+    elif op == "wan_causal_conv3d":
+        layer = DistWanCausalConv3d(
             payload["in_ch"],
             payload["out_ch"],
             kernel_size=payload["kernel"],
@@ -101,6 +132,19 @@ def _dist_worker(
         layer.load_state_dict(payload["state_dict"])
         layer.to(device)
         out = layer(x[..., start:end, :])
+    elif op == "ltx2_causal_conv3d":
+        layer = DistLTX2VideoCausalConv3d(
+            payload["in_ch"],
+            payload["out_ch"],
+            kernel_size=payload["kernel"],
+            stride=payload["stride"],
+            dilation=payload["dilation"],
+            groups=payload["groups"],
+            spatial_padding_mode=payload["spatial_padding_mode"],
+        )
+        layer.load_state_dict(payload["state_dict"])
+        layer.to(device)
+        out = layer(x[..., start:end, :], causal=payload["causal"])
     else:
         raise ValueError(f"Unknown op: {op}")
 
@@ -143,8 +187,8 @@ def _run_multi_rank(op: str, payload: dict, world_size: int) -> None:
                 payload["stride"],
                 payload["padding"],
             )
-        elif op == "causal_conv3d":
-            expected = _reference_causal_conv3d(
+        elif op == "wan_causal_conv3d":
+            expected = _reference_wan_causal_conv3d(
                 x,
                 payload["state_dict"],
                 payload["in_ch"],
@@ -153,6 +197,19 @@ def _run_multi_rank(op: str, payload: dict, world_size: int) -> None:
                 payload["stride"],
                 payload["padding"],
             )
+        elif op == "ltx2_causal_conv3d":
+            expected = _reference_ltx2_causal_conv3d(
+                x,
+                payload["state_dict"],
+                payload["in_ch"],
+                payload["out_ch"],
+                payload["kernel"],
+                payload["stride"],
+                payload["dilation"],
+                payload["groups"],
+                payload["spatial_padding_mode"],
+                payload["causal"],
+            )
         else:
             raise ValueError(f"Unknown op: {op}")
 
@@ -160,7 +217,9 @@ def _run_multi_rank(op: str, payload: dict, world_size: int) -> None:
             assert torch.equal(actual, expected.cpu())
         elif op == "conv2d":
             assert_close(actual, expected.cpu(), atol=1e-5, rtol=1e-5)
-        elif op == "causal_conv3d":
+        elif op == "wan_causal_conv3d":
+            assert_close(actual, expected.cpu(), atol=1e-3, rtol=1e-3)
+        elif op == "ltx2_causal_conv3d":
             assert_close(actual, expected.cpu(), atol=1e-3, rtol=1e-3)
 
     finally:
@@ -218,7 +277,7 @@ def test_dist_conv2d(case, world_size):
     ],
 )
 @pytest.mark.parametrize("world_size", [1, 2, 4, 8])
-def test_dist_causal_conv3d(case, world_size):
+def test_dist_wan_causal_conv3d(case, world_size):
     if not dist.is_available():
         pytest.skip("torch.distributed is not available")
 
@@ -238,4 +297,47 @@ def test_dist_causal_conv3d(case, world_size):
         "stride": case["stride"],
         "state_dict": state_dict,
     }
-    _run_multi_rank("causal_conv3d", payload, world_size=world_size)
+    _run_multi_rank("wan_causal_conv3d", payload, world_size=world_size)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        {"shape": (1, 6, 8, 90, 40), "kernel": 3, "stride": 1, "dilation": 1},
+        {"shape": (2, 4, 5, 16, 12), "kernel": 3, "stride": 1, "dilation": 1},
+    ],
+)
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("spatial_padding_mode", ["zeros", "reflect"])
+@pytest.mark.parametrize("world_size", [1, 2, 4, 8])
+def test_dist_ltx2_causal_conv3d(case, causal, spatial_padding_mode, world_size):
+    if not dist.is_available():
+        pytest.skip("torch.distributed is not available")
+
+    batch, in_ch, frames, height, width = case["shape"]
+    out_ch = in_ch * 3
+    groups = 1
+    conv = LTX2VideoCausalConv3d(
+        in_ch,
+        out_ch,
+        kernel_size=case["kernel"],
+        stride=case["stride"],
+        dilation=case["dilation"],
+        groups=groups,
+        spatial_padding_mode=spatial_padding_mode,
+    )
+    state_dict = conv.state_dict()
+    x = torch.randn(batch, in_ch, frames, height, width)
+    payload = {
+        "x": x,
+        "in_ch": in_ch,
+        "out_ch": out_ch,
+        "kernel": case["kernel"],
+        "stride": case["stride"],
+        "dilation": case["dilation"],
+        "groups": groups,
+        "spatial_padding_mode": spatial_padding_mode,
+        "state_dict": state_dict,
+        "causal": causal,
+    }
+    _run_multi_rank("ltx2_causal_conv3d", payload, world_size=world_size)
