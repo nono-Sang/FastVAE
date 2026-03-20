@@ -10,85 +10,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# def _iter_down_spatial_strides(blocks):
-#     if not blocks:
-#         return
-#     for block in blocks:
-#         downsamplers = getattr(block, "downsamplers", None)
-#         if downsamplers is None:
-#             continue
-#         for sampler in downsamplers:
-#             stride = getattr(sampler, "stride", None)
-#             if stride is None and hasattr(sampler, "conv"):
-#                 stride = getattr(sampler.conv, "stride", None)
-#             if stride is None:
-#                 continue
-#             yield stride[1]
-
-
-# def _iter_up_spatial_strides(blocks):
-#     if not blocks:
-#         return
-#     for block in blocks:
-#         upsamplers = getattr(block, "upsamplers", None)
-#         if upsamplers is None:
-#             continue
-#         for sampler in upsamplers:
-#             stride = getattr(sampler, "stride", None)
-#             if stride is None and hasattr(sampler, "conv"):
-#                 stride = getattr(sampler.conv, "stride", None)
-#             if stride is None:
-#                 continue
-#             yield stride[1]
-
-
-# def _calc_down_align_factor(blocks) -> int:
-#     factor = 1
-#     for s in _iter_down_spatial_strides(blocks) or []:
-#         if s == 2:
-#             factor *= 2
-#     return factor
-
-
-# def _calc_up_total_factor(blocks) -> int:
-#     factor = 1
-#     for s in _iter_up_spatial_strides(blocks) or []:
-#         if s == 2:
-#             factor *= 2
-#     return factor
-
-
-# def _calc_aligned_split_sizes(total: int, align: int) -> list[int] | None:
-#     world_size = dist_env.get_vae_group_size()
-#     if world_size <= 1 or align <= 1:
-#         return None
-#     if total % align != 0:
-#         return None
-#     units = total // align
-#     base = units // world_size
-#     remainder = units % world_size
-#     sizes = [base + (1 if i < remainder else 0) for i in range(world_size)]
-#     return [s * align for s in sizes]
-
-
-# def _downsampled_sizes(sizes: list[int] | None, factor: int) -> list[int] | None:
-#     if sizes is None or factor == 1:
-#         return sizes
-#     out = []
-#     start = 0
-#     for size in sizes:
-#         end = start + size
-#         out.append(end // factor - start // factor)
-#         start = end
-#     return out
-
-
-# def _upsampled_sizes(sizes: list[int] | None, factor: int) -> list[int] | None:
-#     if sizes is None or factor == 1:
-#         return sizes
-#     return [s * factor for s in sizes]
-
-
 def _patch_downsampler3d_forward(forward_func):
     def dist_downsampler3d_forward(
         self, hidden_states: torch.Tensor, causal: bool | None = None
@@ -127,18 +48,6 @@ def _patch_encoder3d_forward():
         # Thanks for driving me insane with the weird patching order :(
         hidden_states = hidden_states.permute(0, 1, 3, 7, 5, 2, 4, 6).flatten(1, 4)
 
-        # # 1. auto split height with aligned sizes for spatial downsampling
-        # align = _calc_down_align_factor(self.down_blocks)
-        # pad_h = 0
-        # if dist_env.get_vae_group_size() > 1 and align > 1:
-        #     total_h = hidden_states.shape[3]
-        #     required = align * dist_env.get_vae_group_size()
-        #     pad_h = (required - total_h % required) % required
-        #     if pad_h:
-        #         hidden_states = F.pad(hidden_states, (0, 0, 0, pad_h, 0, 0))
-        # sizes = _calc_aligned_split_sizes(hidden_states.shape[3], align)
-        # hidden_states = split_tensor(hidden_states, dim=3, sizes=sizes)
-
         hidden_states = split_tensor(hidden_states, dim=3)
         hidden_states = self.conv_in(hidden_states, causal=causal)
 
@@ -165,14 +74,6 @@ def _patch_encoder3d_forward():
         last_channel = last_channel.repeat(1, hidden_states.size(1) - 2, 1, 1, 1)
         hidden_states = torch.cat([hidden_states, last_channel], dim=1)
 
-        # 2. auto gather height
-        # sizes_out = _downsampled_sizes(sizes, align)
-        # hidden_states = gather_tensor(hidden_states, dim=3, sizes=sizes_out)
-        # if pad_h:
-        #     pad_out = pad_h // align
-        #     if pad_out:
-        #         hidden_states = hidden_states[:, :, :, :-pad_out, :]
-
         hidden_states = gather_tensor(hidden_states, dim=3)
         return hidden_states
 
@@ -187,17 +88,6 @@ def _patch_decoder3d_forward():
         causal: bool | None = None,
     ):
         causal = causal or self.is_causal
-
-        # 1. auto split height
-        # pad_h = 0
-        # sizes = None
-        # if dist_env.get_vae_group_size() > 1:
-        #     total_h = hidden_states.shape[3]
-        #     if total_h < dist_env.get_vae_group_size():
-        #         pad_h = dist_env.get_vae_group_size() - total_h
-        #         hidden_states = F.pad(hidden_states, (0, 0, 0, pad_h, 0, 0))
-        #         sizes = [1] * dist_env.get_vae_group_size()
-        # hidden_states = split_tensor(hidden_states, dim=3, sizes=sizes)
 
         hidden_states = split_tensor(hidden_states, dim=3)
         hidden_states = self.conv_in(hidden_states, causal=causal)
@@ -240,15 +130,6 @@ def _patch_decoder3d_forward():
 
         p = self.patch_size
         p_t = self.patch_size_t
-
-        # 2. auto gather height
-        # up_factor = _calc_up_total_factor(self.up_blocks)
-        # sizes_out = _upsampled_sizes(sizes, up_factor)
-        # hidden_states = gather_tensor(hidden_states, dim=3, sizes=sizes_out)
-        # if pad_h:
-        #     pad_out = pad_h * up_factor
-        #     if pad_out:
-        #         hidden_states = hidden_states[:, :, :, :-pad_out, :]
 
         hidden_states = gather_tensor(hidden_states, dim=3)
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
